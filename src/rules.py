@@ -4,6 +4,8 @@ TITLE='职业辐射剂量与异常事件'; ENTITY='剂量事件'; ID_PREFIX='RD'
 SEVERITIES=['low', 'elevated', 'high', 'critical']; STATES=['recorded', 'reviewing', 'investigation', 'follow_up', 'closed']; TRANSITIONS={'recorded': ['reviewing'], 'reviewing': ['investigation'], 'investigation': ['follow_up'], 'follow_up': ['closed'], 'closed': []}; TRANSITION_ROLES={'reviewing': ['radiation_officer'], 'investigation': ['radiation_officer'], 'follow_up': ['health_physicist'], 'closed': ['health_physicist']}
 CREATE_ROLES=set(['dosimetrist']); RECORD_ROLES=set(['radiation_officer', 'health_physicist']); AUDIT_ROLES=set(['health_physicist', 'viewer']); VIEW_ROLES=set(['dosimetrist', 'radiation_officer', 'health_physicist', 'viewer'])
 SEVERITY_WEIGHT={'low': 1.0, 'elevated': 3.0, 'high': 6.0, 'critical': 9.0}; DEADLINE_HOURS={'low': 72, 'elevated': 24, 'high': 8, 'critical': 4}; TERMINAL_STATES=set(['closed'])
+MONTHLY_INVESTIGATION_LEVEL_MSV=2.0; PERIOD_STATES=['open', 'sealed']; SUMMARY_STATES=['provisional', 'confirmed']
+DOSE_READING_ROLES=set(['dosimetrist']); DOSE_CORRECT_ROLES=set(['dosimetrist']); DOSE_AGGREGATE_ROLES=set(['radiation_officer']); DOSE_SEAL_ROLES=set(['radiation_officer'])
 def priority_score(severity,quantity=0.0,threshold=1.0,open_records=0):
     if severity not in SEVERITY_WEIGHT: raise ValidationError("unknown severity")
     ratio=quantity/threshold if threshold>0 else 1.0
@@ -20,3 +22,22 @@ def validate_transition(current,target):
     if not can_transition(current,target): raise ConflictError(f"不能从{current}转换到{target}")
 def completion_blockers(target,open_records): return ["仍有未关闭事项"] if target in TERMINAL_STATES and open_records>0 else []
 def role_for_transition(target): return set(TRANSITION_ROLES.get(target,[]))
+def validate_period(value):
+    if not isinstance(value,str): raise ValidationError("周期格式必须为YYYY-MM")
+    parts=value.strip().split("-")
+    if len(parts)!=2 or len(parts[0])!=4 or not parts[0].isdigit() or len(parts[1])!=2 or not parts[1].isdigit(): raise ValidationError("周期格式必须为YYYY-MM")
+    if not 1<=int(parts[1])<=12: raise ValidationError("周期月份必须在01到12之间")
+    return parts[0]+"-"+parts[1]
+def previous_period(period):
+    year=int(period[:4]); month=int(period[5:7])
+    return f"{year-1}-12" if month==1 else f"{year}-{month-1:02d}"
+def aggregate_by_source(readings):
+    breakdown={}
+    for reading in readings:
+        source=reading["source"]
+        breakdown[source]=round(breakdown.get(source,0.0)+reading["dose_msv"],4)
+    return breakdown,round(sum(breakdown.values()),4)
+def investigation_required(total_msv,level=MONTHLY_INVESTIGATION_LEVEL_MSV): return total_msv>=level
+def dose_conclusion(total_msv,level=MONTHLY_INVESTIGATION_LEVEL_MSV):
+    if investigation_required(total_msv,level): return f"累计剂量{total_msv}mSv达到调查水平{level}mSv，必须调查"
+    return f"累计剂量{total_msv}mSv低于调查水平{level}mSv，无需调查"

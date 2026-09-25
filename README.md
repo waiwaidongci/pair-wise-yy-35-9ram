@@ -31,8 +31,21 @@ python3 app.py --db ./data.db --port 8312
 - `POST /api/items/{id}/records`
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
 - `GET /api/audit`
+- `POST /api/dose/readings`：上报个人剂量读数（dosimetrist），按`external_ref`拒绝重复上报
+- `POST /api/dose/readings/{id}/correct`：退回更正，新值取代旧值，原记录保留为`superseded`
+- `POST /api/dose/aggregate`：月度归集（radiation_officer），同一人员同一周期按来源汇总
+- `POST /api/dose/seal`：封存周期，当前归集结果转为`confirmed`并冻结
+- `GET /api/dose/summary?person_id=&period=[&version=]`：来源明细、累计量、上一周期对比与调查结论
+- `GET /api/dose/readings?person_id=&period=`：全部读数（含被更正的原记录）
 
 允许角色：dosimetrist, radiation_officer, health_physicist, viewer。剂量与调查水平之比决定升级程度，超过阈值必须进入调查；更正剂量不能覆盖已确认审计记录。
+
+## 月度归集规则
+
+- 同一人员同一周期（`YYYY-MM`）按来源汇总有效读数，重复上报按来源唯一标识拒绝。
+- 更正读数以新记录取代旧值，原记录保留且状态置为`superseded`，只能对最新有效读数发起更正。
+- 周期封存后拒绝新增读数，但仍接受退回更正；封存后再次归集会生成新版本，已确认（`confirmed`）版本不被修改。
+- 月调查水平为`2.0 mSv`，累计量达到即判定必须调查；查看结果包含来源明细、累计量、与上一周期（优先取已确认版本）的差值对比及调查结论。
 
 ## 测试
 

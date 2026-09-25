@@ -98,6 +98,22 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"events": service.audit(role)})
+                elif path == "/api/dose/summary":
+                    actor, role = self._identity()
+                    del actor
+                    params = parse_qs(urlparse(self.path).query)
+                    version_raw = params.get("version", [None])[0]
+                    version = int(version_raw) if version_raw is not None else None
+                    self._json(200, service.get_dose_summary(
+                        params.get("person_id", [None])[0],
+                        params.get("period", [None])[0], role, version))
+                elif path == "/api/dose/readings":
+                    actor, role = self._identity()
+                    del actor
+                    params = parse_qs(urlparse(self.path).query)
+                    self._json(200, {"readings": service.list_dose_readings(
+                        params.get("person_id", [None])[0],
+                        params.get("period", [None])[0], role)})
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -110,6 +126,15 @@ def make_handler(service: Service, static_dir: str):
                 body = self._body()
                 if path == "/api/items":
                     self._json(201, service.create_item(body, actor, role))
+                elif path == "/api/dose/readings":
+                    self._json(201, service.submit_reading(body, actor, role))
+                elif path.startswith("/api/dose/readings/") and path.endswith("/correct"):
+                    reading_id = int(path.split("/")[4])
+                    self._json(201, service.correct_reading(reading_id, body, actor, role))
+                elif path == "/api/dose/aggregate":
+                    self._json(200, service.aggregate_period(body, actor, role))
+                elif path == "/api/dose/seal":
+                    self._json(200, service.seal_period(body, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))

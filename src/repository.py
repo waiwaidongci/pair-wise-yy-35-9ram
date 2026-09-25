@@ -65,6 +65,49 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS dose_readings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    person_id TEXT NOT NULL,
+                    period TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    dose_msv REAL NOT NULL CHECK(dose_msv >= 0),
+                    external_ref TEXT NOT NULL,
+                    supersedes_id INTEGER REFERENCES dose_readings(id),
+                    status TEXT NOT NULL DEFAULT 'effective'
+                        CHECK(status IN ('effective','superseded')),
+                    reason TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(person_id, period, source, external_ref)
+                );
+                CREATE INDEX IF NOT EXISTS ix_dose_readings_person_period
+                    ON dose_readings(person_id, period);
+                CREATE TABLE IF NOT EXISTS dose_periods (
+                    person_id TEXT NOT NULL,
+                    period TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','sealed')),
+                    sealed_by TEXT,
+                    sealed_at TEXT,
+                    PRIMARY KEY(person_id, period)
+                );
+                CREATE TABLE IF NOT EXISTS dose_summaries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    person_id TEXT NOT NULL,
+                    period TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    total_msv REAL NOT NULL,
+                    breakdown TEXT NOT NULL,
+                    reading_count INTEGER NOT NULL,
+                    prev_period TEXT,
+                    prev_total_msv REAL,
+                    delta_msv REAL,
+                    investigation_required INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'provisional'
+                        CHECK(status IN ('provisional','confirmed')),
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(person_id, period, version)
+                );
             """)
 
     @staticmethod
@@ -156,6 +199,227 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    @staticmethod
+    def _summary(row: sqlite3.Row) -> Dict[str, Any]:
+        item = dict(row)
+        item["breakdown"] = json.loads(item["breakdown"])
+        item["investigation_required"] = bool(item["investigation_required"])
+        return item
+
+    def _ensure_dose_period(self, person_id: str, period: str) -> Dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT * FROM dose_periods WHERE person_id=? AND period=?",
+            (person_id, period),
+        ).fetchone()
+        if row is None:
+            self.conn.execute(
+                "INSERT INTO dose_periods(person_id, period, status) VALUES(?,?, 'open')",
+                (person_id, period),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM dose_periods WHERE person_id=? AND period=?",
+                (person_id, period),
+            ).fetchone()
+        return dict(row)
+
+    def get_dose_period(self, person_id: str, period: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM dose_periods WHERE person_id=? AND period=?",
+                (person_id, period),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_dose_reading(self, reading_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM dose_readings WHERE id=?", (reading_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("读数不存在")
+        return dict(row)
+
+    def add_dose_reading(self, person_id: str, period: str, source: str,
+                         dose_msv: float, external_ref: str, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        try:
+            with self._lock, self.conn:
+                period_row = self._ensure_dose_period(person_id, period)
+                if period_row["status"] == "sealed":
+                    raise ConflictError("周期已封存，新读数请走更正流程")
+                cur = self.conn.execute(
+                    """INSERT INTO dose_readings(person_id, period, source, dose_msv,
+                       external_ref, supersedes_id, status, reason, created_by, created_at)
+                       VALUES(?,?,?,?,?,NULL,'effective',NULL,?,?)""",
+                    (person_id, period, source, dose_msv, external_ref, actor, now),
+                )
+                reading_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("重复上报：该来源标识已存在") from exc
+        return self.get_dose_reading(reading_id)
+
+    def correct_dose_reading(self, reading_id: int, dose_msv: float, external_ref: str,
+                             reason: Optional[str], actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        try:
+            with self._lock, self.conn:
+                row = self.conn.execute(
+                    "SELECT * FROM dose_readings WHERE id=?", (reading_id,)
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError("读数不存在")
+                if row["status"] != "effective":
+                    raise ConflictError("该读数已被更正，请对最新读数发起更正")
+                cur = self.conn.execute(
+                    """INSERT INTO dose_readings(person_id, period, source, dose_msv,
+                       external_ref, supersedes_id, status, reason, created_by, created_at)
+                       VALUES(?,?,?,?,?,?,'effective',?,?,?)""",
+                    (row["person_id"], row["period"], row["source"], dose_msv,
+                     external_ref, reading_id, reason, actor, now),
+                )
+                new_id = int(cur.lastrowid)
+                self.conn.execute(
+                    "UPDATE dose_readings SET status='superseded' WHERE id=?", (reading_id,)
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("重复上报：该来源标识已存在") from exc
+        return self.get_dose_reading(new_id)
+
+    def list_dose_readings(self, person_id: str, period: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM dose_readings WHERE person_id=? AND period=? ORDER BY id",
+                (person_id, period),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def effective_dose_readings(self, person_id: str, period: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT * FROM dose_readings
+                   WHERE person_id=? AND period=? AND status='effective' ORDER BY id""",
+                (person_id, period),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_dose_summary(self, person_id: str, period: str,
+                         version: Optional[int] = None) -> Dict[str, Any]:
+        with self._lock:
+            if version is None:
+                row = self.conn.execute(
+                    """SELECT * FROM dose_summaries WHERE person_id=? AND period=?
+                       ORDER BY version DESC LIMIT 1""",
+                    (person_id, period),
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    """SELECT * FROM dose_summaries
+                       WHERE person_id=? AND period=? AND version=?""",
+                    (person_id, period, version),
+                ).fetchone()
+        if row is None:
+            raise NotFoundError("归集结果不存在")
+        return self._summary(row)
+
+    def latest_dose_summary(self, person_id: str, period: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT * FROM dose_summaries WHERE person_id=? AND period=?
+                   ORDER BY version DESC LIMIT 1""",
+                (person_id, period),
+            ).fetchone()
+        return self._summary(row) if row is not None else None
+
+    def confirmed_dose_summary(self, person_id: str, period: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT * FROM dose_summaries
+                   WHERE person_id=? AND period=? AND status='confirmed'""",
+                (person_id, period),
+            ).fetchone()
+        return self._summary(row) if row is not None else None
+
+    def save_dose_summary(self, person_id: str, period: str, data: Dict[str, Any],
+                          actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        breakdown = json.dumps(data["breakdown"], ensure_ascii=False, sort_keys=True)
+        required = 1 if data["investigation_required"] else 0
+        with self._lock, self.conn:
+            period_row = self._ensure_dose_period(person_id, period)
+            if period_row["status"] == "sealed":
+                row = self.conn.execute(
+                    """SELECT MAX(version) AS v FROM dose_summaries
+                       WHERE person_id=? AND period=?""",
+                    (person_id, period),
+                ).fetchone()
+                version = int(row["v"] or 0) + 1
+                self.conn.execute(
+                    """INSERT INTO dose_summaries(person_id, period, version, total_msv,
+                       breakdown, reading_count, prev_period, prev_total_msv, delta_msv,
+                       investigation_required, status, created_by, created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,'provisional',?,?)""",
+                    (person_id, period, version, data["total_msv"], breakdown,
+                     data["reading_count"], data["prev_period"], data["prev_total_msv"],
+                     data["delta_msv"], required, actor, now),
+                )
+            else:
+                existing = self.conn.execute(
+                    """SELECT id FROM dose_summaries
+                       WHERE person_id=? AND period=? AND status='provisional'""",
+                    (person_id, period),
+                ).fetchone()
+                if existing is not None:
+                    self.conn.execute(
+                        """UPDATE dose_summaries SET total_msv=?, breakdown=?,
+                           reading_count=?, prev_period=?, prev_total_msv=?, delta_msv=?,
+                           investigation_required=?, created_by=?, created_at=?
+                           WHERE id=?""",
+                        (data["total_msv"], breakdown, data["reading_count"],
+                         data["prev_period"], data["prev_total_msv"], data["delta_msv"],
+                         required, actor, now, existing["id"]),
+                    )
+                else:
+                    self.conn.execute(
+                        """INSERT INTO dose_summaries(person_id, period, version, total_msv,
+                           breakdown, reading_count, prev_period, prev_total_msv, delta_msv,
+                           investigation_required, status, created_by, created_at)
+                           VALUES(?,?,1,?,?,?,?,?,?,?,'provisional',?,?)""",
+                        (person_id, period, data["total_msv"], breakdown,
+                         data["reading_count"], data["prev_period"],
+                         data["prev_total_msv"], data["delta_msv"], required, actor, now),
+                    )
+        return self.get_dose_summary(person_id, period)
+
+    def seal_dose_period(self, person_id: str, period: str, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            period_row = self._ensure_dose_period(person_id, period)
+            if period_row["status"] == "sealed":
+                raise ConflictError("周期已封存")
+            summary = self.conn.execute(
+                """SELECT id FROM dose_summaries
+                   WHERE person_id=? AND period=? AND status='provisional'
+                   ORDER BY version DESC LIMIT 1""",
+                (person_id, period),
+            ).fetchone()
+            if summary is None:
+                raise ConflictError("尚无归集结果，请先归集再封存")
+            self.conn.execute(
+                """UPDATE dose_periods SET status='sealed', sealed_by=?, sealed_at=?
+                   WHERE person_id=? AND period=?""",
+                (actor, now, person_id, period),
+            )
+            self.conn.execute(
+                "UPDATE dose_summaries SET status='confirmed' WHERE id=?",
+                (summary["id"],),
+            )
+            summary_id = int(summary["id"])
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM dose_summaries WHERE id=?", (summary_id,)
+            ).fetchone()
+        return self._summary(row)
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
