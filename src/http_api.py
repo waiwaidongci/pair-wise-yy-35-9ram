@@ -98,6 +98,35 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"events": service.audit(role)})
+                elif path == "/api/dose/persons":
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"persons": service.list_persons(role)})
+                elif path == "/api/dose/periods":
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"periods": service.list_periods(role)})
+                elif path == "/api/dose/summaries":
+                    actor, role = self._identity()
+                    del actor
+                    query = parse_qs(urlparse(self.path).query)
+                    period = query.get("period", [None])[0]
+                    self._json(200, {"summaries": service.list_month_summaries(role, period)})
+                elif (path.startswith("/api/dose/persons/")
+                      and "/months/" in path and path.endswith("/view")):
+                    parts = path.split("/")
+                    person_id, period = int(parts[4]), parts[6]
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.get_month_view(person_id, period, role))
+                elif (path.startswith("/api/dose/persons/")
+                      and "/months/" in path and path.endswith("/readings")):
+                    parts = path.split("/")
+                    person_id, period = int(parts[4]), parts[6]
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"readings": service.list_readings(
+                        person_id, period, role)})
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -119,6 +148,20 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif path == "/api/dose/persons":
+                    self._json(201, service.register_person(body, actor, role))
+                elif path == "/api/dose/readings":
+                    self._json(201, service.submit_reading(body, actor, role))
+                elif path.startswith("/api/dose/readings/") and path.endswith("/corrections"):
+                    reading_id = int(path.split("/")[4])
+                    self._json(201, service.correct_reading(
+                        reading_id, body, actor, role))
+                elif path == "/api/dose/collections":
+                    self._json(200, service.collect_month(body, actor, role))
+                elif path == "/api/dose/periods/seal":
+                    self._json(200, service.seal_period(body, actor, role))
+                elif path == "/api/dose/summaries/confirm":
+                    self._json(200, service.confirm_summary(body, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
